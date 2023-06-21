@@ -1,0 +1,322 @@
+---
+title: '🤖 Binary Classification of Machine Failures in R'
+date: '`r Sys.Date()`'
+output:
+  html_document:
+    theme: paper
+    code_folding: hide
+    number_sections: true
+    toc: true
+    toc_depth: 3
+---
+# Introduction
+"The dataset for this competition (both train and test) was generated from a deep learning model trained on the Machine Failure Predictions. Feature distributions are close to, but not exactly the same, as the original. Feel free to use the original dataset as part of this competition, both to explore differences as well as to see whether incorporating the original in training improves model performance."
+
+# Importing packages and data
+
+First we are going to open the necessary libraries and the data.
+
+```{r, message=FALSE, fig.align = "center"}
+#data 
+library(stargazer)
+library(tidyverse)
+library(ggplot2)
+library(RColorBrewer)
+library(GGally)
+
+##organizing data
+library(caret) 
+library(stargazer)  
+library(tidyverse) 
+library(caTools) 
+
+##modeling
+library(performance)
+library(rpart)
+library(rpart.plot)
+library(rattle) 
+```
+As we can see, there are no NA's, so we won't need to imput any values
+
+```{r, message=FALSE, fig.align = "center"}
+train <- read.csv("C:/Users/guima/Documents/R/Binary Classification of Machine Failures/train.csv")
+test <- read.csv("C:/Users/guima/Documents/R/Binary Classification of Machine Failures/test.csv")
+
+train$Type <- factor(train$Type, levels = c("H", "L", "M"))
+
+summary(train)
+```
+# Overview
+```{r, message=FALSE, fig.align = "center"}
+train %>%
+  group_by(Type) %>%
+  summarise(count = n()) %>%
+  mutate(frequency = count*100/sum(count)) %>%
+  ggplot(aes(fill=Type, y=frequency, x=Type)) + 
+  geom_bar(position="dodge", stat="identity") +
+  scale_fill_brewer(palette = "Set1") +
+  scale_y_continuous(labels = scales::percent_format(scale = 1)) +
+  theme_light() +
+  labs(title="(%) observations by type",
+       fill="",
+       x="",
+       y="") +
+  theme(plot.title = element_text(hjust = 0.5, face = "bold")) +
+  theme(legend.position="none")
+```
+
+## What makes a machine fail?
+Machine type seemly does  not play an important factor. Between the categorical variables, **HDF, PWF and OSF** seem to be key factors.
+```{r, message=FALSE, fig.align = "center"}
+train %>%
+  mutate(Fail = ifelse(Machine.failure == 1, "Failed", "Still Working")) %>%
+  group_by(Type, Fail) %>%
+  summarise(Observations = n()) %>%
+  mutate(`Frequency (%)` = Observations*100/sum(Observations)) %>%
+  ggplot(aes(fill=Fail, y=`Frequency (%)`, x=Type)) + 
+  geom_bar(position="dodge", stat="identity") +
+  scale_fill_brewer(palette = "Set1") +
+  scale_y_continuous(labels = scales::percent_format(scale = 1)) +
+  theme_light() +
+  labs(title="(%) of fails type",
+       fill="",
+       x="",
+       y="") +
+  theme(plot.title = element_text(hjust = 0.5, face = "bold")) +
+  theme(legend.position="top")
+```
+
+**Rotational Speed, Torque and Tool Wear** also look important.
+
+```{r, message=FALSE, fig.align = "center"}
+train %>%
+  mutate(Fail = ifelse(Machine.failure == 1, "Failed", "Still Working")) %>%
+  ggplot(aes(fill=Type, y=Rotational.speed..rpm., x=Type)) + 
+  geom_boxplot() +
+  scale_fill_brewer(palette = "Set1") +
+  theme_light() +
+  facet_wrap(~Fail) +
+  labs(title="Median Rotational by type",
+       fill="",
+       x="",
+       y="") +
+  theme(plot.title = element_text(hjust = 0.5, face = "bold")) +
+  theme(legend.position="none")
+
+train %>%
+  mutate(Fail = ifelse(Machine.failure == 1, "Failed", "Still Working")) %>%
+  ggplot(aes(fill=Type, y=Torque..Nm., x=Type)) + 
+  geom_boxplot() +
+  scale_fill_brewer(palette = "Set1") +
+  theme_light() +
+  facet_wrap(~Fail) +
+  labs(title="Median Torque by type",
+       fill="",
+       x="",
+       y="") +
+  theme(plot.title = element_text(hjust = 0.5, face = "bold")) +
+  theme(legend.position="none")
+
+train %>%
+  mutate(Fail = ifelse(Machine.failure == 1, "Failed", "Still Working")) %>%
+  ggplot(aes(fill=Type, y=Tool.wear..min., x=Type)) + 
+  geom_boxplot() +
+  scale_fill_brewer(palette = "Set1") +
+  theme_light() +
+  facet_wrap(~Fail) +
+  labs(title="Median Tool Wear by type",
+       fill="",
+       x="",
+       y="") +
+  theme(plot.title = element_text(hjust = 0.5, face = "bold")) +
+  theme(legend.position="none")
+```
+Another way to view the relationship between machine failure and the variables is through a **correlogram**. In our case, the **Machine.Failure** columns and rows are the most important.
+```{r, message=FALSE, fig.align = "center"}
+train %>%
+  select(!id) %>%
+  select(!Product.ID) %>%
+  ggcorr(method = c("everything", "pearson"), low = "#4DAF4A" , mid = "#377EB8" , high = "#E41A1C", 
+         label = TRUE, label_size = 4, label_color = "white",size =4, layout.exp =1) +
+  labs(title="Basic Correlogram",
+       x="",
+       y="") +
+  theme(plot.title = element_text(hjust = 0.5, face = "bold")) +
+  theme(legend.position="bottom")
+```
+As we can see, with the exception of RNF, all the categorical variables have a positive correlation with machine failure. Rotational Speed, Torque and Tool Wear also hold a relation with failure - all of this **matches the assumptions we made** through our graphical annalysis.
+
+# Predicting machine failure
+We are going to use **3 different prediction models** - most of them are based off the book **Machine Learning with R**, by Brett Lantz.
+Before actually heading to  the models, the first step is **dividing the train dataset into testing and training samples**.
+
+```{r, message=FALSE, fig.align = "center"}
+#first, set seed and train our model
+df <- train %>%
+  select(!id) %>%
+  select(!Product.ID)
+
+set.seed(237)
+
+train_index = createDataPartition(y = df$Machine.failure,  # y = our dependent variable.
+                                  p = .7,  # Specifies split into 70% & 30%.
+                                  list = FALSE,  # Sets results to matrix form. 
+                                  times = 1)  # Sets number of partitions to create to 1. 
+
+
+#Now we can split our data into train and test data using the randomly sampled train_index that we just formed.
+
+train_data = df[train_index,]  # Use train_index of iris data to create train_data.
+test_data = df[-train_index,]  # Use whatever that is not in train_index to create test_data.
+```
+
+## Logistic regression
+📌 What is logistic regression? According to IBM, this type of statistical model (also known as logit model) is often used for classification and predictive analytics. Logistic regression estimates the probability of an event occurring, such as voted or didn't vote, based on a given dataset of independent variables.
+We are going to use this model to calculate the **probability of machine failure**.
+
+```{r, message=FALSE, fig.align = "center"}
+model_log = glm(Machine.failure~.,
+            data = train_data,
+            family = "binomial", maxit = 100)
+
+res <- predict(model_log, test_data, type = 'response')
+res <- predict(model_log, train_data, type = 'response')
+
+summary(model_log)
+```
+It is woth mentioning that the (***) next to the Pr(>|z|) column is associated with the p-value and represents the **statistical significance** of the variable; if there are no (*), it imples that the variable has no relevance in explaining the results of our model.
+
+📌 The **p value** is defined as the probability of observing the given value of the test statistic, or greater, under the null hypothesis.
+
+Having trained our model, we can plot a **confusion matrix**. This matrix allows us to check how well our regression is doing.
+
+```{r, message=FALSE, fig.align = "center"}
+confmatrix <- table(Actual_Value = train_data$Machine.failure, predicted_value = res > 0.5)
+confmatrix
+
+(confmatrix[[1,1]] + confmatrix[[2,2]])*100 / sum(confmatrix)
+```
+As we can see, our regression got **99% of the predictions right** - it is a pretty good result. Now, we can predict the results in our test sample!
+```{r, message=FALSE, fig.align = "center"}
+pred_log <- predict(model_log, test, type="response")
+
+## Look at probability output
+solution_log = data.frame(id = test$id, Machine.failure = ifelse(pred_log > 0.5, 1, 0))
+head(solution_log, 5)
+
+```
+## Regression tree
+📌 According to Lantz, **trees for numeric prediction** fall into two categories. The first, known as **regression trees**, were introduced in the 1980s as part of the seminal Classification and Regression Tree (CART) algorithm. Despite the name, regression trees do not use linear regression methods as described earlier in this chapter; rather, they make **predictions based on the average value of examples** that reach a leaf.
+```{r, message=FALSE, fig.align = "center"}
+##training a model on the data
+rt_model <- rpart(Machine.failure~., data = train_data)
+
+rt_predict <- predict(rt_model, test_data)
+
+summary(rt_model)
+```
+A really nice feature of this method is that it allows us to get a visual representation of the model.
+```{r, message=FALSE, fig.align = "center"}
+##Visualizing decision trees
+rpart.plot(rt_model, digits = 4, fallen.leaves = TRUE,
+           type = 3, extra = 101)
+```
+Just like Lantz, we are going to use the **Mean Absolute Error** as way to measure model performance. 
+
+```{r, message=FALSE, fig.align = "center"}
+###Measuring performance with mean absolute error
+MAE <- function(actual, predicted) {
+  mean(abs(actual - predicted))
+}
+
+MAE(rt_predict, test_data$Machine.failure)
+```
+The result implies that **our results are, on average, 0.0077 far from the actual results** (0 and 1). Once again, this result is quite good!
+Finally, we can predict our solution sample. 
+
+```{r, message=FALSE, fig.align = "center"}
+##predicting 
+pred_rt <- predict(rt_model, test)
+
+solution_rt = data.frame(id = test$id, Machine.failure = round(pred_rt,0))
+
+head(solution_rt, n=5)
+
+```
+## Decision tree
+The last method we are going to use is the **decision tree**. We can say that "the model itself comprises a series of **logical decisions**, similar to a flowchart, with decision nodes that indicate a decision to be made on an attribute. These split into branches that indicate the decision's choices. The tree is terminated by leaf nodes (also known as terminal nodes) that denote the result of following a combination of decisions".
+
+📌 This model is more typically used when it comes to categorical data, but we can try and adapt it to our case.
+
+```{r, message=FALSE, fig.align = "center"}
+train_data <- train_data %>%
+  mutate(Failed = ifelse(Machine.failure == 1, "Failed", "Still Working")) %>%
+  select(!Machine.failure)
+
+test_data <- test_data %>%
+  mutate(Failed = ifelse(Machine.failure == 1, "Failed", "Still Working")) %>%
+  select(!Machine.failure)
+```
+First, we are going to add a column to our datasets that returns **Failed** and **Still Working**, based off the condition of the machine; then, we can train our model.
+
+```{r, message=FALSE, fig.align = "center"}
+fitControl = trainControl(method = "cv", number = 10, savePredictions = TRUE)
+
+dt_model = train(Failed ~ ., # Set Y variable followed by '~'. The period indicates to include all variables for prediction. 
+                  data = train_data, # Data
+                  method = 'rpart', # Specify SVM model
+                  trControl = fitControl) # Use cross validation
+
+confusionMatrix(dt_model)
+```
+The confusion matrix implies that our model has an **efficacy of 99%**. It is also interesting to note that the mistakes were all regarding machines that are still working.
+
+We can also view the importance of our variables, as well as visual representation of our decision tree.
+
+```{r, message=FALSE, fig.align = "center"}
+### Create object of importance of our variables 
+
+dt_importance <- varImp(dt_model)
+
+#### Create plot of importance of variables.
+
+ggplot(data = dt_importance, mapping = aes(x = dt_importance[,1])) + # Data & mapping
+  geom_boxplot() + # Create box plot
+  theme_light() +
+  labs(title="Variable importance: Decision tree model",
+       fill="",
+       x="",
+       y="") +
+  theme(plot.title = element_text(hjust = 0.5, face = "bold"))
+
+### Now lets plot the decision tree using fancyRpartPlot() from the RATTLE package. This will give us clear insight into how the model makes its predictions.
+
+fancyRpartPlot(dt_model$finalModel, sub = '')
+```
+
+```{r, message=FALSE, fig.align = "center", echo=FALSE}
+###PREDICTION: Decision tree model - Use the created dt_model to run a prediction on the test data.
+
+prediction_dt = predict(dt_model, test_data)
+
+####Check the proportion of the predictions which were accurate.
+
+table(prediction_dt, test_data$Failed) %>% # Create prediction table. 
+  prop.table() %>% # Convert table values into proportions instead of counts. 
+  round(2) # Round numbers to 2 significant values. 
+```
+Finally, we can predict our model - we are going to add back the dummy column that returns 0 for machines still working and 1 otherwise.
+```{r, message=FALSE, fig.align = "center"}
+pred_dt <- predict(dt_model, test)
+
+solution_dt = data.frame(id = test$id, Failed = pred_dt) 
+
+solution_dt <- solution_dt %>%
+  mutate(Machine.Failure = ifelse(Failed == "Failed", 1,0))
+
+head(solution_dt, n=5)
+```
+
+# Conclusion
+One really nice thing to note is that the models used mainly the **categorical variables to produce the prediction** - it is quite clear when we look the decision and regression trees. This goes back to our **overall analysis**, where we first stated that **HDF, PWF and OSF** seem to be key factors on determining if a machine failed or not. It also shows how even a basic graphical/statiscal overview of the data can be helpful when it comes to **understanding patterns**.
+We were able to predict our answers based on **three different models**. If we explore the sample submissions, we can see that there were some differences in the values inputed, but **overall all the models returned quite similar results**.
